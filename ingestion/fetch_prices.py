@@ -1,11 +1,17 @@
 """
+Prices ingestion script.
 Reads station IDs already sitting in raw.stations, batches them
 (Tankerkönig allows up to 10 IDs per request), calls prices.php,
 and inserts each station's price snapshot into raw.prices.
+
+Includes a small delay between batches and retry-with-backoff on
+rate-limit / server errors, since we're now checking 1000+ stations
+per run instead of just 36.
 """
 
 import os
 import json
+import time
 import requests
 import psycopg2
 from dotenv import load_dotenv
@@ -22,7 +28,9 @@ DB_CONFIG = {
     "password": os.environ["DB_PASSWORD"],
 }
 
-BATCH_SIZE = 10  # Tankerkönig's per-request limit for prices.php
+BATCH_SIZE = 10        # Tankerkönig's per-request limit for prices.php
+DELAY_BETWEEN_BATCHES = 3.5  # seconds — be polite, avoid 503s
+MAX_RETRIES = 3
 
 
 def get_station_ids(conn):
@@ -34,7 +42,6 @@ def get_station_ids(conn):
 
 
 def chunk(lst, size):
-    """Split a list into consecutive chunks of `size`."""
     for i in range(0, len(lst), size):
         yield lst[i:i + size]
 
@@ -45,9 +52,17 @@ def fetch_prices(station_ids_batch):
         "ids": ",".join(station_ids_batch),
         "apikey": API_KEY,
     }
-    response = requests.get(url, params=params, timeout=10)
-    response.raise_for_status()
-    return response.json()
+    for attempt in range(1, MAX_RETRIES + 1):
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 503:
+            wait = attempt * 10  # 10s, 20s, 30s — was 3/6/9, too short for this endpoint
+            print(f"    503 rate-limited, waiting {wait}s (attempt {attempt}/{MAX_RETRIES})")
+            time.sleep(wait)
+            continue
+        response.raise_for_status()
+        return response.json()
+    print(f"    Giving up on this batch after {MAX_RETRIES} retries.")
+    return {"ok": False, "reason": "exhausted retries"}
 
 
 def insert_prices(conn, prices_dict):
@@ -72,14 +87,17 @@ if __name__ == "__main__":
     print(f"Found {len(station_ids)} stations to price-check.")
 
     total_inserted = 0
-    for batch in chunk(station_ids, BATCH_SIZE):
+    total_batches = (len(station_ids) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for i, batch in enumerate(chunk(station_ids, BATCH_SIZE), start=1):
         data = fetch_prices(batch)
         if not data.get("ok"):
-            print("API call failed for batch:", batch, "->", data)
-            continue
-        inserted = insert_prices(conn, data["prices"])
-        total_inserted += inserted
-        print(f"  Batch of {len(batch)} stations -> inserted {inserted} price records.")
+            print(f"  [{i}/{total_batches}] API call failed for batch -> {data}")
+        else:
+            inserted = insert_prices(conn, data["prices"])
+            total_inserted += inserted
+            print(f"  [{i}/{total_batches}] inserted {inserted} price records.")
+        time.sleep(DELAY_BETWEEN_BATCHES)
 
     conn.close()
     print(f"Done. Total price records inserted: {total_inserted}")
