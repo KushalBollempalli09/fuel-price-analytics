@@ -1,0 +1,11 @@
+version: 2
+
+models:
+  - name: dim_station
+    description: One row per gas station, with brand and location attributes.
+    columns:
+      - name: station_id
+        description: Primary key — Tankerkönig's stable station UUID.
+        tests:
+          - unique
+          - not_null
