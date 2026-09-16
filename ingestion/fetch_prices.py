@@ -1,17 +1,18 @@
 """
 Prices ingestion script.
-Reads station IDs already sitting in raw.stations, batches them
-(Tankerkönig allows up to 10 IDs per request), calls prices.php,
-and inserts each station's price snapshot into raw.prices.
+Reads station IDs already sitting in raw.stations, batches them,
+calls prices.php, and inserts each station's price snapshot into raw.prices.
 
-Includes a small delay between batches and retry-with-backoff on
-rate-limit / server errors, since we're now checking 1000+ stations
-per run instead of just 36.
+Includes retry/backoff on rate limits and network errors, and a lock file
+to prevent overlapping cron runs if one execution takes longer than the
+scheduled interval.
 """
 
 import os
 import json
 import time
+import sys
+from datetime import datetime
 import requests
 import psycopg2
 from dotenv import load_dotenv
@@ -28,9 +29,31 @@ DB_CONFIG = {
     "password": os.environ["DB_PASSWORD"],
 }
 
-BATCH_SIZE = 10        # Tankerkönig's per-request limit for prices.php
-DELAY_BETWEEN_BATCHES = 3.5  # seconds — be polite, avoid 503s
+BATCH_SIZE = 10
+DELAY_BETWEEN_BATCHES = 3.5
 MAX_RETRIES = 3
+
+LOCK_FILE = "/tmp/fetch_prices.lock"
+STALE_LOCK_SECONDS = 25 * 60  # if a lock is older than 25 min, assume the run that made it crashed
+
+
+def acquire_lock():
+    if os.path.exists(LOCK_FILE):
+        age = time.time() - os.path.getmtime(LOCK_FILE)
+        if age < STALE_LOCK_SECONDS:
+            return False  # a real, recent run is presumably still active
+        print(f"Found a stale lock ({int(age)}s old) — a previous run likely crashed. Removing it.")
+        os.remove(LOCK_FILE)
+    with open(LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def release_lock():
+    try:
+        os.remove(LOCK_FILE)
+    except FileNotFoundError:
+        pass
 
 
 def get_station_ids(conn):
@@ -48,10 +71,7 @@ def chunk(lst, size):
 
 def fetch_prices(station_ids_batch):
     url = "https://creativecommons.tankerkoenig.de/json/prices.php"
-    params = {
-        "ids": ",".join(station_ids_batch),
-        "apikey": API_KEY,
-    }
+    params = {"ids": ",".join(station_ids_batch), "apikey": API_KEY}
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = requests.get(url, params=params, timeout=15)
@@ -74,10 +94,7 @@ def insert_prices(conn, prices_dict):
     cur = conn.cursor()
     for station_id, price_data in prices_dict.items():
         cur.execute(
-            """
-            INSERT INTO raw.prices (station_id, payload)
-            VALUES (%s, %s)
-            """,
+            "INSERT INTO raw.prices (station_id, payload) VALUES (%s, %s)",
             (station_id, json.dumps(price_data)),
         )
     conn.commit()
@@ -86,25 +103,31 @@ def insert_prices(conn, prices_dict):
 
 
 if __name__ == "__main__":
-    from datetime import datetime
     print(f"\n=== Run started: {datetime.now().isoformat()} ===")
-    conn = psycopg2.connect(**DB_CONFIG)
 
-    station_ids = get_station_ids(conn)
-    print(f"Found {len(station_ids)} stations to price-check.")
+    if not acquire_lock():
+        print("Another run is already in progress (lock file present). Skipping this run.")
+        sys.exit(0)
 
-    total_inserted = 0
-    total_batches = (len(station_ids) + BATCH_SIZE - 1) // BATCH_SIZE
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        station_ids = get_station_ids(conn)
+        print(f"Found {len(station_ids)} stations to price-check.")
 
-    for i, batch in enumerate(chunk(station_ids, BATCH_SIZE), start=1):
-        data = fetch_prices(batch)
-        if not data.get("ok"):
-            print(f"  [{i}/{total_batches}] API call failed for batch -> {data}")
-        else:
-            inserted = insert_prices(conn, data["prices"])
-            total_inserted += inserted
-            print(f"  [{i}/{total_batches}] inserted {inserted} price records.")
-        time.sleep(DELAY_BETWEEN_BATCHES)
+        total_inserted = 0
+        total_batches = (len(station_ids) + BATCH_SIZE - 1) // BATCH_SIZE
 
-    conn.close()
-    print(f"Done. Total price records inserted: {total_inserted}")
+        for i, batch in enumerate(chunk(station_ids, BATCH_SIZE), start=1):
+            data = fetch_prices(batch)
+            if not data.get("ok"):
+                print(f"  [{i}/{total_batches}] API call failed for batch -> {data}")
+            else:
+                inserted = insert_prices(conn, data["prices"])
+                total_inserted += inserted
+                print(f"  [{i}/{total_batches}] inserted {inserted} price records.")
+            time.sleep(DELAY_BETWEEN_BATCHES)
+
+        conn.close()
+        print(f"Done. Total price records inserted: {total_inserted}")
+    finally:
+        release_lock()
