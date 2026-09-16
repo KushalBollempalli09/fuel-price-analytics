@@ -9,3 +9,19 @@ models:
         tests:
           - unique
           - not_null
+
+  - name: fact_price_observation
+    description: One row per station, per fuel type, per price observation.
+    columns:
+      - name: station_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_station')
+                field: station_id
+      - name: fuel_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['e5', 'e10', 'diesel']
