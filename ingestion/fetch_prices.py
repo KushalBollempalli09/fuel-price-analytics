@@ -53,14 +53,19 @@ def fetch_prices(station_ids_batch):
         "apikey": API_KEY,
     }
     for attempt in range(1, MAX_RETRIES + 1):
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 503:
-            wait = attempt * 10  # 10s, 20s, 30s — was 3/6/9, too short for this endpoint
-            print(f"    503 rate-limited, waiting {wait}s (attempt {attempt}/{MAX_RETRIES})")
+        try:
+            response = requests.get(url, params=params, timeout=15)
+            if response.status_code == 503:
+                wait = attempt * 10
+                print(f"    503 rate-limited, waiting {wait}s (attempt {attempt}/{MAX_RETRIES})")
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            wait = attempt * 5
+            print(f"    Network error ({type(e).__name__}), retrying in {wait}s (attempt {attempt}/{MAX_RETRIES})")
             time.sleep(wait)
-            continue
-        response.raise_for_status()
-        return response.json()
     print(f"    Giving up on this batch after {MAX_RETRIES} retries.")
     return {"ok": False, "reason": "exhausted retries"}
 
@@ -81,6 +86,8 @@ def insert_prices(conn, prices_dict):
 
 
 if __name__ == "__main__":
+    from datetime import datetime
+    print(f"\n=== Run started: {datetime.now().isoformat()} ===")
     conn = psycopg2.connect(**DB_CONFIG)
 
     station_ids = get_station_ids(conn)
