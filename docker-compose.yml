@@ -12,5 +12,14 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
+  metabase:
+    image: metabase/metabase:latest
+    container_name: fuel_metabase
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+
 volumes:
   pgdata:
